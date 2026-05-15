@@ -1,0 +1,9 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python agent.py start"
+restartPolicyType = "always"
+healthcheckPath = "/"
+healthcheckTimeout = 300
