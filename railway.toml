@@ -1,9 +1,0 @@
-[build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-startCommand = "python agent.py start"
-restartPolicyType = "always"
-# No healthcheckPath — this is a long-running worker process, not an HTTP server.
-# Railway considers the container healthy as long as the process keeps running.

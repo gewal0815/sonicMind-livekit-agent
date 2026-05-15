@@ -1,5 +1,4 @@
-livekit-agents[openai,silero]>=0.12.0
+livekit-agents[openai,silero]>=1.0.0
 livekit>=0.17.0
 openai>=1.30.0
 python-dotenv>=1.0.0
-torch>=2.0.0
