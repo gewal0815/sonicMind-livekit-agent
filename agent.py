@@ -7,13 +7,22 @@ from dotenv import load_dotenv
 from livekit.agents import Agent, AgentSession, AgentServer, JobContext, JobProcess, cli
 from livekit.plugins import openai, silero
 
+import os
+
 load_dotenv()
 
 logger = logging.getLogger("sonicmind-agent")
+logging.basicConfig(level=logging.INFO)
 
 AGENT_NAME = "sonicmind-agent"
 server = AgentServer()
 
+logger.info(
+    "SonicMind agent starting — LIVEKIT_URL=%s API_KEY_SET=%s OPENAI_KEY_SET=%s",
+    os.getenv("LIVEKIT_URL", "(not set)"),
+    bool(os.getenv("LIVEKIT_API_KEY")),
+    bool(os.getenv("OPENAI_API_KEY")),
+)
 
 INSTRUCTIONS_BASE = (
     "You are SonicMind AI, a helpful voice assistant. "
