@@ -395,32 +395,30 @@ async def _append_call_transcript(room_name: str, role: str, text: str, metadata
     if not text:
         return
     entry = {
+        "room_name": room_name,
+        "workspace_id": metadata.get("workspaceId"),
+        "session_id": metadata.get("sessionId"),
         "role": role,
         "text": text,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "roomName": room_name,
-        "userId": metadata.get("userId"),
-        "workspaceId": metadata.get("workspaceId"),
-        "sessionId": metadata.get("sessionId"),
+        "speaker": metadata.get("userName") if role == "user" else "SonicMind AI",
+        "spoken_at": datetime.now(timezone.utc).isoformat(),
+        "metadata": {
+            "roomName": room_name,
+            "userId": metadata.get("userId"),
+            "workspaceId": metadata.get("workspaceId"),
+            "sessionId": metadata.get("sessionId"),
+        },
     }
 
-    def _append():
-        room_name_filter = urllib.parse.quote(room_name, safe="")
-        rows = _supabase_request(
-            f"/rest/v1/livekit_call_recordings?room_name=eq.{room_name_filter}&select=transcript&limit=1"
-        )
-        current = []
-        if rows and isinstance(rows[0].get("transcript"), list):
-            current = rows[0]["transcript"]
-        current.append(entry)
+    def _insert():
         _supabase_request(
-            f"/rest/v1/livekit_call_recordings?room_name=eq.{room_name_filter}",
-            method="PATCH",
-            body={"transcript": current, "updated_at": datetime.now(timezone.utc).isoformat()},
+            "/rest/v1/livekit_call_transcript_entries",
+            method="POST",
+            body=entry,
         )
 
     try:
-        await asyncio.to_thread(_append)
+        await asyncio.to_thread(_insert)
     except Exception as exc:
         logger.warning("Failed to append LiveKit transcript for %s: %s", room_name, exc)
 
