@@ -216,11 +216,17 @@ async def entrypoint(ctx: JobContext) -> None:
             llm=openai.realtime.RealtimeModel(voice="alloy"),
         )
     else:
+        # Fall back to loading VAD inline if prewarm didn't populate userdata
+        # (guards against KeyError if setup_fnc was skipped on this version).
+        vad = ctx.proc.userdata.get("vad")
+        if vad is None:
+            logger.warning("VAD not in userdata from prewarm; loading now")
+            vad = silero.VAD.load()
         session = AgentSession(
             stt=openai.STT(model="whisper-1"),
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(model="tts-1", voice="alloy"),
-            vad=ctx.proc.userdata["vad"],
+            vad=vad,
         )
 
     await session.start(
