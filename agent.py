@@ -220,7 +220,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         "roomName": ctx.room.name,
     }
 
-    has_user_context = bool(room_context["workspaceId"] and room_context["userId"])
+    has_user_context = bool(room_context["userId"])
     use_automation = AUTOMATION_ENABLED and has_user_context
 
     logger.info(
