@@ -67,6 +67,7 @@ Use it whenever the user asks to:
 → ALWAYS call `run_app_command` — do NOT say you cannot access the app.
 → After the tool returns, speak the result naturally.
 → If the tool returns a confirmation prompt, read it out and wait for yes / no.
+→ If the tool returns a failure, tell the user exactly what failed once and stop. Do not retry the same action unless the user gives new information or explicitly asks you to try again.
 
 Guidelines:
 - Be concise. Keep answers under 3 sentences unless asked for more.
@@ -193,7 +194,7 @@ creating Hyperframe videos, or managing dashboards. Pass the user's exact spoken
             error = result.get("error", "")
             if error in ("unrecognised_intent", "parse-error", "no_action"):
                 return "__FALLBACK__"
-            return speak or "Something went wrong. Please try again."
+            return speak or f"That action failed: {error or 'unknown error'}"
 
         return speak or "Processing your request."
 
