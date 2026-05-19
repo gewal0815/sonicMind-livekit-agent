@@ -138,10 +138,16 @@ async def send_confirmation(run_id: str, approved: bool, context: dict) -> dict:
 # ── Agent class ───────────────────────────────────────────────────────────
 
 class SonicMindAgent(Agent):
-    def __init__(self, instructions: str, room_context: dict, use_automation: bool) -> None:
+    """Basic agent — no automation tools."""
+    pass
+
+
+class SonicMindAgentWithAutomation(Agent):
+    """Agent with run_app_command tool for voice automation."""
+
+    def __init__(self, instructions: str, room_context: dict) -> None:
         super().__init__(instructions=instructions)
         self._room_ctx = room_context
-        self._use_automation = use_automation
         self._pending: dict = {}
 
     @function_tool
@@ -229,10 +235,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )
 
     instructions = SYSTEM_PROMPT_WITH_AUTOMATION if use_automation else SYSTEM_PROMPT_BASIC
-    agent = SonicMindAgent(
-        instructions=instructions,
-        room_context=room_context,
-        use_automation=use_automation,
+    agent: Agent = (
+        SonicMindAgentWithAutomation(instructions=instructions, room_context=room_context)
+        if use_automation
+        else SonicMindAgent(instructions=instructions)
     )
 
     session = AgentSession(
