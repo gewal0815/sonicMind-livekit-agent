@@ -1,433 +1,327 @@
-"""SonicMind voice agent - explicit-dispatch LiveKit worker."""
+"""
+SonicMind LiveKit AI Agent
+--------------------------
+Joins workspace meeting rooms and voice-agent rooms.
+- Transcribes all participants in real time
+- Generates periodic summaries via LLM
+- Responds to voice commands in voice-agent mode
+- Routes app automation commands to voice-action-controller
+
+Required environment variables:
+  LIVEKIT_URL              wss://your-livekit.railway.app
+  LIVEKIT_API_KEY          API key string
+  LIVEKIT_API_SECRET       API secret string
+  OPENAI_API_KEY           OpenAI API key (for STT, LLM, TTS)
+  SUPABASE_URL             Supabase project URL
+  SUPABASE_SERVICE_ROLE_KEY Supabase service role key
+"""
 
 import asyncio
 import json
 import logging
 import os
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import Annotated
 
-from dotenv import load_dotenv
-from livekit.agents import Agent, AgentSession, AgentServer, JobContext, JobProcess, cli
-
-try:
-    from livekit.agents import function_tool
-except Exception:  # pragma: no cover - older livekit-agents builds still boot.
-    def function_tool(fn=None, **_kwargs):
-        if fn is None:
-            return lambda inner: inner
-        return fn
-
+import aiohttp
+from livekit import agents, rtc
+from livekit.agents import llm, transcription
+from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai, silero
 
-load_dotenv()
-
-logger = logging.getLogger("sonicmind-agent")
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sonicmind-agent")
 
-AGENT_NAME = "sonicmind-agent"
-server = AgentServer()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-logger.info(
-    "SonicMind agent starting - LIVEKIT_URL=%s API_KEY_SET=%s OPENAI_KEY_SET=%s SUPABASE_SET=%s",
-    os.getenv("LIVEKIT_URL", "(not set)"),
-    bool(os.getenv("LIVEKIT_API_KEY")),
-    bool(os.getenv("OPENAI_API_KEY")),
-    bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY")),
-)
+SYSTEM_PROMPT = """You are SonicMind, an intelligent AI meeting and productivity assistant.
+You join workspace video meetings and voice sessions to help participants.
 
-INSTRUCTIONS_BASE = (
-    "You are SonicMind AI, a helpful voice assistant. "
-    "Keep responses concise and conversational. "
-    "Prefer short spoken answers unless the user asks for detail. "
-    "Use the provided workspace report context and report lookup tools when available. "
-    "Never expose or claim access to reports outside the current workspace."
-)
+Your capabilities:
+- Real-time transcription of all speakers
+- Meeting summarization (triggered by voice command or automatic every 10 minutes)
+- Question answering about topics discussed in the meeting
+- Action item extraction and follow-up suggestions
+- FULL CONTROL of the SonicMind platform through voice automation
 
-INSTRUCTIONS_VOICE_AGENT = (
-    "You are in a private 1-on-1 voice session with {user_name}. "
-    "Answer their questions, summarize the conversation so far, and suggest follow-up points."
-)
+IMPORTANT — App Automation:
+You have a tool called `run_app_command` that gives you DIRECT access to control the app.
+When the user asks you to do anything related to:
+  - Reports (create, generate, export, send, open)
+  - Meetings / Calendar (schedule, cancel, invite, check availability, set reminders)
+  - Slide decks (create, export, open editor)
+  - URL analysis (analyze, summarize, compare websites)
+  - Hyperframe videos (create, render, export)
+  - Dashboards and widgets (create, add widget, generate from report)
 
-INSTRUCTIONS_MEETING = (
-    "You have been invited into a live team meeting as an AI assistant. "
-    "There may be multiple speakers. Listen carefully and attribute ideas to speakers when you can. "
-    "You can summarize the discussion so far, identify action items mentioned, list open questions, "
-    "or answer factual questions. Be concise. "
-    "When the host says 'start daily' or 'start the daily', begin the daily standup flow."
-)
+→ ALWAYS call `run_app_command` with the user's exact spoken phrase.
+→ Do NOT say you cannot access the app. You CAN — through `run_app_command`.
+→ After the tool returns, speak the result naturally to the user.
+→ If the tool returns a confirmation prompt, read it out and wait for the user's yes/no.
 
-_DAILY_START_TRIGGERS = {"start daily", "start the daily", "begin daily", "start standup", "begin standup"}
+Guidelines:
+- Be concise. Keep answers under 3 sentences unless asked for more.
+- When summarizing, use bullet points grouped by topic.
+- Always identify yourself as "SonicMind AI" if asked who you are.
+- Speak naturally and professionally.
+- For app commands, acknowledge immediately ("Sure, let me do that for you") before calling the tool.
+"""
 
 
-class SonicMindAssistant(Agent):
-    def __init__(
-        self,
-        user_name: str = "there",
-        room_type: str = "voice_agent",
-        workspace_id: str | None = None,
-        selected_report_id: str | None = None,
-        report_context: dict | None = None,
-    ) -> None:
-        if room_type == "meeting":
-            base_context = INSTRUCTIONS_MEETING
-        else:
-            base_context = INSTRUCTIONS_VOICE_AGENT.format(user_name=user_name)
+# ── Voice Action Controller client ────────────────────────────────────────
 
-        self.workspace_id = workspace_id
-        self.selected_report_id = selected_report_id
-        self.report_context = report_context if isinstance(report_context, dict) else {}
-        self.reports = [
-            report for report in self.report_context.get("reports", [])
-            if isinstance(report, dict) and report.get("id")
-        ]
-        self.allowed_report_ids = set(self.report_context.get("allReportIds") or [r["id"] for r in self.reports])
-        self.report_by_id = {str(report["id"]): report for report in self.reports}
+async def call_voice_action_controller(
+    transcript: str,
+    context: dict,
+) -> dict:
+    """Call the Supabase voice-action-controller edge function."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set — automation disabled")
+        return {"status": "failed", "speakText": "", "uiActions": []}
 
-        super().__init__(
-            instructions=f"{INSTRUCTIONS_BASE} {base_context} {self._workspace_context_instructions()}",
+    url = f"{SUPABASE_URL}/functions/v1/voice-action-controller"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    }
+    payload = {"transcript": transcript, "context": context}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                body = await resp.text()
+                logger.error(f"voice-action-controller {resp.status}: {body[:200]}")
+                return {"status": "failed", "speakText": "", "uiActions": []}
+    except Exception as exc:
+        logger.error(f"voice-action-controller call failed: {exc}")
+        return {"status": "failed", "speakText": "", "uiActions": []}
+
+
+async def confirm_action(run_id: str, approved: bool, context: dict) -> dict:
+    """Send confirmation decision back to voice-action-controller."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return {"status": "failed"}
+
+    url = f"{SUPABASE_URL}/functions/v1/voice-action-controller"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    }
+    payload = {"runId": run_id, "confirmation": approved, "context": context}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                return await resp.json() if resp.status == 200 else {"status": "failed"}
+    except Exception as exc:
+        logger.error(f"Confirm action failed: {exc}")
+        return {"status": "failed"}
+
+
+# ── Function context (tools the LLM can call) ─────────────────────────────
+
+def build_fnc_ctx(room_context: dict) -> llm.FunctionContext:
+    """Build function context with automation tools wired to this room's context."""
+    fnc_ctx = llm.FunctionContext()
+
+    # Holds any pending confirmation run ID between turns
+    pending_confirmation: dict = {}
+
+    @fnc_ctx.ai_callable(
+        description=(
+            "Execute an app automation command. Use this for ANY request that involves "
+            "the SonicMind platform: creating reports, scheduling meetings, analyzing URLs, "
+            "generating slides, creating videos, managing dashboards, or exporting content. "
+            "Pass the user's spoken phrase exactly as-is."
         )
+    )
+    async def run_app_command(
+        spoken_phrase: Annotated[
+            str,
+            llm.TypeInfo(description="The user's spoken automation request, word-for-word"),
+        ],
+    ) -> str:
+        logger.info(f"run_app_command: {spoken_phrase!r}")
 
-    def _workspace_context_instructions(self) -> str:
-        if not self.workspace_id:
-            return (
-                "No workspace report context was provided for this call. "
-                "You may still hold the live conversation and summarize what is said."
+        # If there's a pending confirmation, treat yes/no answers as confirmation
+        phrase_lower = spoken_phrase.strip().lower()
+        if pending_confirmation.get("run_id"):
+            run_id = pending_confirmation["run_id"]
+            approved = any(w in phrase_lower for w in ("yes", "confirm", "do it", "go ahead", "sure", "proceed", "ok", "okay"))
+            rejected = any(w in phrase_lower for w in ("no", "cancel", "stop", "never mind", "nope", "don't"))
+
+            if approved or rejected:
+                pending_confirmation.clear()
+                result = await confirm_action(run_id, approved, room_context)
+                speak = result.get("speakText", "Done." if approved else "Cancelled.")
+                return speak
+
+        # Normal automation request
+        result = await call_voice_action_controller(spoken_phrase, room_context)
+        status = result.get("status", "failed")
+        speak = result.get("speakText", "")
+
+        if status == "needs_confirmation":
+            run_id = result.get("runId")
+            if run_id:
+                pending_confirmation["run_id"] = run_id
+            return speak or "I need your confirmation before proceeding. Please say yes or no."
+
+        if status == "completed":
+            return speak or "Done."
+
+        if status == "failed":
+            error = result.get("error", "")
+            if error in ("unrecognised_intent", "parse-error"):
+                # Not an app command — let LLM answer naturally
+                return "__FALLBACK__"
+            return speak or "Something went wrong. Please try again."
+
+        return speak or "Processing your request."
+
+    return fnc_ctx
+
+
+# ── Participant transcription ─────────────────────────────────────────────
+
+async def transcribe_participants(ctx: agents.JobContext, agent: VoicePipelineAgent) -> None:
+    """Subscribe to all remote participants and log transcriptions."""
+    async def handle_participant(participant: rtc.RemoteParticipant) -> None:
+        logger.info(f"Subscribing to participant: {participant.identity}")
+
+    for participant in ctx.room.remote_participants.values():
+        await handle_participant(participant)
+
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
+        asyncio.ensure_future(handle_participant(participant))
+
+
+async def maybe_generate_summary(
+    ctx: agents.JobContext,
+    agent: VoicePipelineAgent,
+    interval_seconds: int = 600,
+) -> None:
+    """Generate and broadcast a meeting summary every `interval_seconds`."""
+    await asyncio.sleep(interval_seconds)
+    while True:
+        logger.info("Generating periodic meeting summary…")
+        try:
+            await agent.say(
+                "Let me give you a quick meeting summary. "
+                "I've been following the conversation and here are the key points so far.",
+                allow_interruptions=True,
             )
-        if not self.reports:
-            return (
-                f"This call is scoped to workspace {self.workspace_id}, but no reports were available. "
-                "Do not invent report content."
-            )
+        except Exception as exc:
+            logger.warning(f"Summary generation failed: {exc}")
+        await asyncio.sleep(interval_seconds)
 
-        primary = self.selected_report_id or self.report_context.get("primaryReportId")
-        primary_text = (
-            f"The primary selected report is {primary}. Use it first when the user says 'this report'. "
-            if primary else
-            "No primary report is selected. This is workspace/session mode; use any relevant workspace report when asked. "
+
+# ── Entrypoint ────────────────────────────────────────────────────────────
+
+async def entrypoint(ctx: agents.JobContext) -> None:
+    """Agent entrypoint — called once per room dispatch."""
+    logger.info(f"Agent joining room: {ctx.room.name}")
+    await ctx.connect()
+
+    # Parse room metadata (set by livekit-token edge function)
+    room_metadata: dict = {}
+    try:
+        room_metadata = json.loads(ctx.room.metadata or "{}")
+    except Exception:
+        pass
+
+    is_voice_agent_room = (
+        room_metadata.get("room_type") == "voice_agent"
+        or ctx.room.name.startswith("voice-agent-")
+    )
+
+    # Build runtime context passed to voice-action-controller
+    room_context = {
+        "workspaceId": room_metadata.get("workspaceId") or "",
+        "sessionId": room_metadata.get("sessionId") or None,
+        "userId": room_metadata.get("userId") or "",
+        "timezone": "UTC",
+        "locale": "en",
+        "role": "member",
+        "plan": "free",
+        "roomName": ctx.room.name,
+    }
+
+    logger.info(f"Room context: workspaceId={room_context['workspaceId']!r}, userId={room_context['userId']!r}")
+
+    # Only enable automation when we have a valid userId
+    automation_enabled = bool(room_context["workspaceId"] and room_context["userId"])
+    if not automation_enabled:
+        logger.warning("No workspaceId or userId in room metadata — automation disabled for this room")
+
+    participant = await ctx.wait_for_participant()
+    logger.info(f"Connected with participant: {participant.identity}")
+
+    # Build function context (tools) when automation is available
+    fnc_ctx = build_fnc_ctx(room_context) if automation_enabled else None
+
+    # Build voice pipeline
+    agent = VoicePipelineAgent(
+        vad=silero.VAD.load(),
+        stt=openai.STT(model="whisper-1"),
+        llm=openai.LLM(model="gpt-4o-mini"),
+        tts=openai.TTS(voice="alloy"),
+        chat_ctx=llm.ChatContext().append(role="system", text=SYSTEM_PROMPT),
+        fnc_ctx=fnc_ctx,
+        allow_interruptions=True,
+        interrupt_speech_duration=0.5,
+        interrupt_min_words=0,
+        min_endpointing_delay=0.5,
+    )
+
+    agent.start(ctx.room, participant)
+
+    await asyncio.sleep(1)
+
+    if is_voice_agent_room:
+        greeting = (
+            "Hello! I'm SonicMind AI. I can answer questions, generate reports, "
+            "schedule meetings, create slide decks, and much more — all through voice. "
+            "How can I help you?"
+            if automation_enabled
+            else "Hello! I'm SonicMind AI. How can I help you today?"
         )
-        catalog_lines = []
-        for idx, report in enumerate(self.reports[:20], start=1):
-            title = report.get("title") or "Untitled report"
-            report_type = report.get("type") or "report"
-            summary = report.get("summary") or report.get("preview") or ""
-            marker = " PRIMARY" if primary and report.get("id") == primary else ""
-            catalog_lines.append(f"{idx}. [{report.get('id')}] {title} ({report_type}){marker}: {summary}")
-
-        return (
-            f"The live call is scoped to workspace {self.workspace_id}. {primary_text}"
-            "The available workspace report catalog follows. Use search_workspace_reports and "
-            "get_workspace_report for precise details before answering report-specific questions. "
-            + " ".join(catalog_lines)
+    else:
+        greeting = (
+            "Hello everyone! I'm SonicMind AI, your meeting assistant. "
+            "I'll transcribe the conversation and can automate reports, summaries, "
+            "and much more. Just speak naturally."
         )
 
-    @function_tool
-    async def search_workspace_reports(self, query: str) -> str:
-        """Search the current workspace report catalog by title, type, summary, and preview text."""
-        q = (query or "").lower().strip()
-        if not q:
-            return "Please provide a search query."
-        matches = []
-        for report in self.reports:
-            haystack = " ".join([
-                str(report.get("title") or ""),
-                str(report.get("type") or ""),
-                str(report.get("summary") or ""),
-                str(report.get("preview") or ""),
-            ]).lower()
-            if q in haystack:
-                matches.append(report)
-        if not matches:
-            return "No matching reports were found in this workspace."
-        return json.dumps([
-            {
-                "id": report.get("id"),
-                "title": report.get("title"),
-                "type": report.get("type"),
-                "summary": report.get("summary") or report.get("preview"),
-            }
-            for report in matches[:10]
-        ])
+    await agent.say(greeting, allow_interruptions=True)
 
-    @function_tool
-    async def get_workspace_report(self, report_id: str) -> str:
-        """Load a report by ID, restricted to reports injected for the current workspace."""
-        report_id = (report_id or "").strip()
-        if report_id not in self.allowed_report_ids:
-            return "Access denied: that report is not part of the current workspace context."
+    if not is_voice_agent_room:
+        asyncio.ensure_future(transcribe_participants(ctx, agent))
+        asyncio.ensure_future(maybe_generate_summary(ctx, agent, interval_seconds=600))
 
-        fetched = await _fetch_report_from_supabase(report_id, self.workspace_id)
-        if fetched:
-            return fetched
-
-        cached = self.report_by_id.get(report_id)
-        if not cached:
-            return "Report not found in the current workspace context."
-        return json.dumps(cached)
+    # Keep agent alive until room closes
+    try:
+        while True:
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info(f"Agent leaving room: {ctx.room.name}")
 
 
-def prewarm(proc: JobProcess) -> None:
+def prewarm(proc: agents.JobProcess) -> None:
+    """Pre-load models to reduce cold-start latency."""
     proc.userdata["vad"] = silero.VAD.load()
 
 
-server.setup_fnc = prewarm
-
-
-def resolve_mode(room_name: str) -> str:
-    if room_name.startswith("realtime-"):
-        return "realtime"
-    return "pipeline"
-
-
-def get_job_metadata(ctx: JobContext) -> dict:
-    raw_metadata = getattr(getattr(ctx, "job", None), "metadata", "") or "{}"
-    try:
-        parsed = json.loads(raw_metadata)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        logger.warning("Invalid job metadata JSON: %s", raw_metadata)
-        return {}
-
-
-@server.rtc_session(agent_name=AGENT_NAME)
-async def entrypoint(ctx: JobContext) -> None:
-    room_name = getattr(ctx.room, "name", "")
-    metadata = get_job_metadata(ctx)
-    room_type = str(metadata.get("roomType") or "voice_agent")
-    user_name = str(metadata.get("userName") or "there")
-    workspace_id = metadata.get("workspaceId")
-    selected_report_id = metadata.get("selectedReportId")
-    report_context = metadata.get("reportContext") if isinstance(metadata.get("reportContext"), dict) else {}
-    mode = resolve_mode(room_name)
-    logger.info(
-        "Starting %s session for room=%s room_type=%s user_id=%s workspace_id=%s reports=%d primary=%s",
-        mode,
-        room_name,
-        room_type,
-        metadata.get("userId"),
-        workspace_id,
-        len(report_context.get("allReportIds") or []),
-        selected_report_id,
-    )
-
-    if mode == "realtime":
-        session = AgentSession(
-            llm=openai.realtime.RealtimeModel(voice="alloy"),
-        )
-    else:
-        # Fall back to loading VAD inline if prewarm didn't populate userdata
-        # (guards against KeyError if setup_fnc was skipped on this version).
-        vad = ctx.proc.userdata.get("vad")
-        if vad is None:
-            logger.warning("VAD not in userdata from prewarm; loading now")
-            vad = silero.VAD.load()
-        session = AgentSession(
-            stt=openai.STT(model="whisper-1"),
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(model="tts-1", voice="alloy"),
-            vad=vad,
-        )
-
-    await session.start(
-        agent=SonicMindAssistant(
-            user_name=user_name,
-            room_type=room_type,
-            workspace_id=str(workspace_id) if workspace_id else None,
-            selected_report_id=str(selected_report_id) if selected_report_id else None,
-            report_context=report_context,
-        ),
-        room=ctx.room,
-    )
-
-    loop = asyncio.get_event_loop()
-
-    @session.on("user_speech_committed")
-    def on_any_user_speech(ev) -> None:
-        transcript = _event_transcript(ev)
-        if transcript:
-            loop.create_task(_append_call_transcript(room_name, "user", transcript, metadata))
-
-    @session.on("agent_speech_committed")
-    def on_agent_speech(ev) -> None:
-        transcript = _event_transcript(ev)
-        if transcript:
-            loop.create_task(_append_call_transcript(room_name, "agent", transcript, metadata))
-
-    @ctx.room.on("data_received")
-    def on_data_received(dp) -> None:
-        try:
-            raw = getattr(dp, "data", None)
-            if raw is None:
-                return
-            msg = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
-            msg_type = msg.get("type")
-
-            if msg_type == "sonicmind_context":
-                text = str(msg.get("text") or "")
-                if text:
-                    loop.create_task(session.generate_reply(instructions=text))
-                    logger.info("Received SonicMind context packet (%d chars)", len(text))
-
-            if room_type == "meeting" and msg_type == "DAILY_QUESTIONS":
-                questions = msg.get("questions", [])
-                title = str(msg.get("reportTitle") or "the report")
-                if not questions:
-                    return
-                numbered = " ".join(f"Question {i + 1}: {q}" for i, q in enumerate(questions))
-                instructions = (
-                    f"The host has started the daily standup based on '{title}'. "
-                    f"Read the following discussion questions aloud to the team, one by one. {numbered}"
-                )
-                loop.create_task(session.generate_reply(instructions=instructions))
-                logger.info("Received DAILY_QUESTIONS (%d questions) for '%s'", len(questions), title)
-
-            elif room_type == "meeting" and msg_type == "DAILY_COMPLETE":
-                instructions = (
-                    "Announce that the daily standup is complete and all answers have been saved to the report. "
-                    "Keep it short."
-                )
-                loop.create_task(session.generate_reply(instructions=instructions))
-                logger.info("Received DAILY_COMPLETE signal")
-        except Exception as exc:
-            logger.warning("data_received handler error: %s", exc)
-
-    if room_type == "meeting":
-        @session.on("user_speech_committed")
-        def on_user_speech_daily(ev) -> None:
-            try:
-                transcript = _event_transcript(ev).lower().strip()
-                if any(trigger in transcript for trigger in _DAILY_START_TRIGGERS):
-                    logger.info("Detected 'Start Daily' voice command: %r", transcript)
-                    loop.create_task(_publish_daily_start(ctx))
-            except Exception as exc:
-                logger.warning("user_speech_committed handler error: %s", exc)
-
-        greeting = (
-            "Greet the meeting participants. Say you are SonicMind AI and you are here as a meeting assistant. "
-            "Mention that the host can say Start Daily or click the Start Daily button to begin the standup discussion."
-        )
-    else:
-        if selected_report_id:
-            greeting = (
-                f"Greet {user_name if user_name != 'there' else 'the user'} and say you are connected to the selected report "
-                "plus the rest of the workspace reports for context."
-            )
-        else:
-            greeting = (
-                f"Greet {user_name if user_name != 'there' else 'the user'} and say no single report is selected, "
-                "so this conversation will be saved as an Audio Overview for the workspace session."
-            )
-
-    await session.generate_reply(instructions=greeting)
-
-
-async def _publish_daily_start(ctx: JobContext) -> None:
-    try:
-        payload = json.dumps({"type": "DAILY_START"}).encode("utf-8")
-        await ctx.room.local_participant.publish_data(payload, reliable=True)
-        logger.info("Sent DAILY_START to room")
-    except Exception as exc:
-        logger.warning("Failed to publish DAILY_START: %s", exc)
-
-
-def _event_transcript(ev) -> str:
-    transcript = ""
-    if hasattr(ev, "transcript"):
-        transcript = str(ev.transcript or "")
-    elif hasattr(ev, "message") and hasattr(ev.message, "content"):
-        content = ev.message.content
-        if isinstance(content, list):
-            transcript = " ".join(
-                part.text if hasattr(part, "text") else str(part)
-                for part in content
-            )
-        else:
-            transcript = str(content or "")
-    elif hasattr(ev, "text"):
-        transcript = str(ev.text or "")
-    return transcript.strip()
-
-
-def _supabase_request(path: str, method: str = "GET", body: dict | None = None):
-    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-    if not supabase_url or not service_key:
-        return None
-
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        f"{supabase_url}{path}",
-        data=data,
-        method=method,
-        headers={
-            "apikey": service_key,
-            "authorization": f"Bearer {service_key}",
-            "content-type": "application/json",
-            "prefer": "return=representation",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else None
-
-
-async def _fetch_report_from_supabase(report_id: str, workspace_id: str | None) -> str | None:
-    if not workspace_id:
-        return None
-
-    def _fetch():
-        encoded_id = urllib.parse.quote(report_id, safe="")
-        rows = _supabase_request(
-            f"/rest/v1/transcripts?id=eq.{encoded_id}&select=id,session_id,report_title,report_type,report_summary,text,timestamp&limit=1"
-        )
-        if not rows:
-            return None
-        row = rows[0]
-        session_id = urllib.parse.quote(str(row.get("session_id") or ""), safe="")
-        sessions = _supabase_request(f"/rest/v1/sessions?id=eq.{session_id}&select=workspace_id&limit=1")
-        if not sessions or sessions[0].get("workspace_id") != workspace_id:
-            return "Access denied: report is not in this workspace."
-        return json.dumps(row)
-
-    try:
-        return await asyncio.to_thread(_fetch)
-    except Exception as exc:
-        logger.warning("Failed to fetch report %s from Supabase: %s", report_id, exc)
-        return None
-
-
-async def _append_call_transcript(room_name: str, role: str, text: str, metadata: dict) -> None:
-    if not text:
-        return
-    entry = {
-        "room_name": room_name,
-        "workspace_id": metadata.get("workspaceId"),
-        "session_id": metadata.get("sessionId"),
-        "role": role,
-        "text": text,
-        "speaker": metadata.get("userName") if role == "user" else "SonicMind AI",
-        "spoken_at": datetime.now(timezone.utc).isoformat(),
-        "metadata": {
-            "roomName": room_name,
-            "userId": metadata.get("userId"),
-            "workspaceId": metadata.get("workspaceId"),
-            "sessionId": metadata.get("sessionId"),
-        },
-    }
-
-    def _insert():
-        _supabase_request(
-            "/rest/v1/livekit_call_transcript_entries",
-            method="POST",
-            body=entry,
-        )
-
-    try:
-        await asyncio.to_thread(_insert)
-    except Exception as exc:
-        logger.warning("Failed to append LiveKit transcript for %s: %s", room_name, exc)
-
-
 if __name__ == "__main__":
-    cli.run_app(server)
+    agents.cli.run_app(
+        agents.WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+        )
+    )
