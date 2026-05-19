@@ -204,11 +204,17 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info(f"Agent joining room: {ctx.room.name}")
     await ctx.connect()
 
+    # Dispatch metadata (userId, workspaceId, etc.) is in ctx.job.metadata in livekit-agents 1.x.
+    # ctx.room.metadata is the room-level metadata which may be empty.
     room_meta: dict = {}
-    try:
-        room_meta = json.loads(ctx.room.metadata or "{}")
-    except Exception:
-        pass
+    for raw in (getattr(ctx.job, "metadata", None), ctx.room.metadata):
+        if raw:
+            try:
+                room_meta = json.loads(raw)
+                if room_meta:
+                    break
+            except Exception:
+                pass
 
     is_voice_room = (
         room_meta.get("room_type") == "voice_agent"
