@@ -1,6 +1,6 @@
 """
-SonicMind LiveKit AI Agent
---------------------------
+SonicMind LiveKit AI Agent  (livekit-agents 1.x)
+-------------------------------------------------
 Joins workspace meeting rooms and voice-agent rooms.
 - Transcribes all participants in real time
 - Generates periodic summaries via LLM
@@ -22,13 +22,10 @@ import logging
 import os
 from typing import Annotated
 
-from livekit import agents, rtc
-from livekit.agents import llm
-from livekit.agents.pipeline import VoicePipelineAgent
+from livekit import agents
+from livekit.agents import Agent, AgentSession, function_tool
 from livekit.plugins import openai, silero
 
-# aiohttp is only needed for automation — import lazily so missing package
-# does not crash the entire worker process.
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
@@ -47,7 +44,7 @@ if not AIOHTTP_AVAILABLE:
 if not AUTOMATION_ENABLED:
     logger.warning("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — voice automation disabled")
 
-# ── System prompt ─────────────────────────────────────────────────────────
+# ── System prompts ────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT_WITH_AUTOMATION = """You are SonicMind, an intelligent AI meeting and productivity assistant.
 
@@ -91,7 +88,7 @@ Guidelines:
 """
 
 
-# ── Automation HTTP client ────────────────────────────────────────────────
+# ── Automation HTTP helpers ───────────────────────────────────────────────
 
 async def call_voice_action_controller(transcript: str, context: dict) -> dict:
     if not AIOHTTP_AVAILABLE:
@@ -106,7 +103,7 @@ async def call_voice_action_controller(transcript: str, context: dict) -> dict:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, json={"transcript": transcript, "context": context},
-                headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
@@ -130,7 +127,7 @@ async def send_confirmation(run_id: str, approved: bool, context: dict) -> dict:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, json={"runId": run_id, "confirmation": approved, "context": context},
-                headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                headers=headers, timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 return await resp.json() if resp.status == 200 else {"status": "failed"}
     except Exception as exc:
@@ -138,47 +135,49 @@ async def send_confirmation(run_id: str, approved: bool, context: dict) -> dict:
         return {"status": "failed"}
 
 
-# ── Function context (tools) ──────────────────────────────────────────────
+# ── Agent class ───────────────────────────────────────────────────────────
 
-def build_fnc_ctx(room_context: dict) -> llm.FunctionContext:
-    fnc_ctx = llm.FunctionContext()
-    pending: dict = {}  # holds run_id while awaiting confirmation
+class SonicMindAgent(Agent):
+    def __init__(self, instructions: str, room_context: dict, use_automation: bool) -> None:
+        super().__init__(instructions=instructions)
+        self._room_ctx = room_context
+        self._use_automation = use_automation
+        self._pending: dict = {}
 
-    @fnc_ctx.ai_callable(
-        description=(
-            "Execute an app automation command for any SonicMind platform action: "
-            "creating reports, scheduling meetings, analyzing URLs, generating slides, "
-            "creating Hyperframe videos, or managing dashboards. "
-            "Pass the user's exact spoken phrase."
-        )
-    )
+    @function_tool
     async def run_app_command(
+        self,
         spoken_phrase: Annotated[
             str,
-            llm.TypeInfo(description="The user's spoken automation request, word-for-word"),
+            "The user's spoken automation request, word-for-word",
         ],
     ) -> str:
+        """Execute an app automation command for any SonicMind platform action: \
+creating reports, scheduling meetings, analyzing URLs, generating slides, \
+creating Hyperframe videos, or managing dashboards. Pass the user's exact spoken phrase."""
+
         logger.info(f"[automation] run_app_command: {spoken_phrase!r}")
 
-        # Handle pending confirmation
         phrase_lower = spoken_phrase.strip().lower()
-        if pending.get("run_id"):
-            run_id = pending["run_id"]
+
+        # Handle pending confirmation
+        if self._pending.get("run_id"):
+            run_id = self._pending["run_id"]
             approved = any(w in phrase_lower for w in ("yes", "confirm", "do it", "go ahead", "sure", "proceed", "ok", "okay"))
             rejected = any(w in phrase_lower for w in ("no", "cancel", "stop", "never mind", "nope"))
             if approved or rejected:
-                pending.clear()
-                result = await send_confirmation(run_id, approved, room_context)
+                self._pending.clear()
+                result = await send_confirmation(run_id, approved, self._room_ctx)
                 return result.get("speakText", "Done." if approved else "Cancelled.")
 
-        result = await call_voice_action_controller(spoken_phrase, room_context)
+        result = await call_voice_action_controller(spoken_phrase, self._room_ctx)
         status = result.get("status", "failed")
         speak = result.get("speakText", "")
 
         if status == "needs_confirmation":
             run_id = result.get("runId")
             if run_id:
-                pending["run_id"] = run_id
+                self._pending["run_id"] = run_id
             return speak or "I need your confirmation. Please say yes or no."
 
         if status == "completed":
@@ -187,39 +186,10 @@ def build_fnc_ctx(room_context: dict) -> llm.FunctionContext:
         if status == "failed":
             error = result.get("error", "")
             if error in ("unrecognised_intent", "parse-error", "no_action"):
-                return "__FALLBACK__"  # LLM will answer naturally
+                return "__FALLBACK__"
             return speak or "Something went wrong. Please try again."
 
         return speak or "Processing your request."
-
-    return fnc_ctx
-
-
-# ── Background tasks ──────────────────────────────────────────────────────
-
-async def transcribe_participants(ctx: agents.JobContext, agent: VoicePipelineAgent) -> None:
-    async def handle_participant(participant: rtc.RemoteParticipant) -> None:
-        logger.info(f"Participant joined: {participant.identity}")
-
-    for participant in ctx.room.remote_participants.values():
-        await handle_participant(participant)
-
-    @ctx.room.on("participant_connected")
-    def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
-        asyncio.ensure_future(handle_participant(participant))
-
-
-async def periodic_summary(ctx: agents.JobContext, agent: VoicePipelineAgent, interval: int = 600) -> None:
-    await asyncio.sleep(interval)
-    while True:
-        try:
-            await agent.say(
-                "Here's a quick summary of the conversation so far.",
-                allow_interruptions=True,
-            )
-        except Exception as exc:
-            logger.warning(f"Periodic summary failed: {exc}")
-        await asyncio.sleep(interval)
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────
@@ -228,7 +198,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info(f"Agent joining room: {ctx.room.name}")
     await ctx.connect()
 
-    # Parse room metadata injected by livekit-token edge function
     room_meta: dict = {}
     try:
         room_meta = json.loads(ctx.room.metadata or "{}")
@@ -259,27 +228,25 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         f"automation={use_automation} | workspaceId={room_context['workspaceId']!r}"
     )
 
-    participant = await ctx.wait_for_participant()
-    logger.info(f"Participant joined: {participant.identity}")
+    instructions = SYSTEM_PROMPT_WITH_AUTOMATION if use_automation else SYSTEM_PROMPT_BASIC
+    agent = SonicMindAgent(
+        instructions=instructions,
+        room_context=room_context,
+        use_automation=use_automation,
+    )
 
-    system_prompt = SYSTEM_PROMPT_WITH_AUTOMATION if use_automation else SYSTEM_PROMPT_BASIC
-    fnc_ctx = build_fnc_ctx(room_context) if use_automation else None
-
-    agent = VoicePipelineAgent(
+    session = AgentSession(
         vad=silero.VAD.load(),
         stt=openai.STT(model="whisper-1"),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=openai.TTS(voice="alloy"),
-        chat_ctx=llm.ChatContext().append(role="system", text=system_prompt),
-        fnc_ctx=fnc_ctx,
         allow_interruptions=True,
-        interrupt_speech_duration=0.5,
-        interrupt_min_words=0,
-        min_endpointing_delay=0.5,
     )
 
-    agent.start(ctx.room, participant)
-    await asyncio.sleep(1)
+    await session.start(room=ctx.room, agent=agent)
+
+    participant = await ctx.wait_for_participant()
+    logger.info(f"Participant joined: {participant.identity}")
 
     if is_voice_room:
         greeting = (
@@ -294,19 +261,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             "I'll help with transcription, summaries, and automation. Just speak naturally."
         )
 
-    await agent.say(greeting, allow_interruptions=True)
-
-    if not is_voice_room:
-        asyncio.ensure_future(transcribe_participants(ctx, agent))
-        asyncio.ensure_future(periodic_summary(ctx, agent))
-
-    try:
-        while True:
-            await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        logger.info(f"Agent leaving room: {ctx.room.name}")
+    await session.say(greeting, allow_interruptions=True)
 
 
 def prewarm(proc: agents.JobProcess) -> None:
